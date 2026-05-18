@@ -58,8 +58,14 @@ namespace utils {
 		cli.set_follow_location(true);
 		auto res = cli.Get(path.c_str());
 
-		if (!res || res->status != 200) {
-			std::cerr << "Chyba: " << res->status << std::endl;
+		// OPRAVA: Bezpecnejsi kontrola odpovedi ze serveru
+		if (!res) {
+			std::cerr << "Chyba: pozadavek selhal (no response pro URL: " << url << ")" << std::endl;
+			return "";
+		}
+
+		if (res->status != 200) {
+			std::cerr << "Chyba: HTTP status " << res->status << " pro URL: " << url << std::endl;
 			return "";
 		}
 
