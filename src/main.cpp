@@ -10,6 +10,10 @@
 #include <queue>
 #include <set>
 #include <sstream>
+#include <filesystem>
+#include <fstream>
+#include <chrono>
+#include <iomanip>
 
 #include "utils.h"
 #include "server.h"
@@ -25,29 +29,70 @@ enum MPITags {
 
 // Pomocná funkce Mastera, která se zavolá, když uživatel odešle formulář na webu
 void processMasterDistribution(const std::vector<std::string>& URLs, std::string& vystup, int n, int m) {
-	std::cout << "[Master] Prijato " << URLs.size() << " URL adres z weboveho formulare. Rozdeluji praci..." << std::endl;
+	std::cout << "[Master] Prijato " << URLs.size() << " URL adres. Rozdeluji praci..." << std::endl;
 
-	int target_worker_a = 1; // Začneme od Workera A s rankem 1
-
+	// Odeslání práce Workerům A
+	int target_worker_a = 1;
 	for (const auto& url : URLs) {
-		// Posíláme URL jako C-řetězec (pole znaků) včetně ukončovacího znaku \0 (+1)
 		MPI_Send(url.c_str(), url.size() + 1, MPI_CHAR, target_worker_a, TAG_URL_TO_WORKER_A, MPI_COMM_WORLD);
-		
-		std::cout << "[Master] Odeslano URL: " << url << " na Workera A (Rank " << target_worker_a << ")" << std::endl;
-
-		// Posuneme se na dalšího Workera A (Round-Robin rozdělování)
 		target_worker_a++;
-		if (target_worker_a > n) {
-			target_worker_a = 1;
-		}
+		if (target_worker_a > n) target_worker_a = 1;
 	}
 
-	vystup = "<h3>Zpracování spuštěno na pozadí...</h3>";
-	vystup += "<p>Počet odeslaných URL: " + std::to_string(URLs.size()) + "</p><ul>";
-	for (const auto& url : URLs) {
-		vystup += "<li>" + url + "</li>";
+	// Příprava výpisu pro uživatele
+	vystup = "<h3>Zpracování dokončeno!</h3><ul>";
+
+	// Čekání na výsledky od Workerů A
+	int completed_jobs = 0;
+	while (completed_jobs < URLs.size()) {
+		MPI_Status status;
+		MPI_Probe(MPI_ANY_SOURCE, TAG_DONE_FROM_A, MPI_COMM_WORLD, &status);
+		
+		int msg_size;
+		MPI_Get_count(&status, MPI_CHAR, &msg_size);
+		std::vector<char> buffer(msg_size);
+		MPI_Recv(buffer.data(), msg_size, MPI_CHAR, status.MPI_SOURCE, TAG_DONE_FROM_A, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+		std::string payload(buffer.data());
+		
+		// Rozkouskování přijatých dat (oddělovač je |||)
+		size_t pos1 = payload.find("|||");
+		size_t pos2 = payload.find("|||", pos1 + 3);
+		
+		std::string base_url = payload.substr(0, pos1);
+		std::string map_txt = payload.substr(pos1 + 3, pos2 - pos1 - 3);
+		std::string content_txt = payload.substr(pos2 + 3);
+
+		// Vytvoření bezpečného názvu složky
+		auto t = std::time(nullptr);
+		auto tm = *std::localtime(&t);
+		std::ostringstream time_ss;
+		time_ss << std::put_time(&tm, "%Y_%m_%d_%H_%M_");
+		
+		std::string safe_url = base_url;
+		for (char& c : safe_url) {
+			if (!isalnum(c)) c = '_'; // Nahradí speciální znaky podtržítkem
+		}
+		
+		std::string dir_name = "results/" + time_ss.str() + safe_url;
+		std::filesystem::create_directories(dir_name);
+
+		// Uložení do souborů
+		std::ofstream map_file(dir_name + "/map.txt");
+		map_file << map_txt;
+		
+		std::ofstream content_file(dir_name + "/content.txt");
+		content_file << content_txt;
+		
+		std::ofstream log_file(dir_name + "/log.txt");
+		log_file << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "\nOK\n";
+
+		std::cout << "[Master] Vysledky pro " << base_url << " ulozeny do slozky: " << dir_name << std::endl;
+		vystup += "<li>Data pro <b>" + base_url + "</b> uložena do: <code>" + dir_name + "</code></li>";
+
+		completed_jobs++;
 	}
-	vystup += "</ul><p>Sledujte konzoli pro prubeh.</p>";
+	vystup += "</ul><p>Všechny zadané domény byly úspěšně prohledány.</p>";
 }
 
 // Funkce, kterou bude vykonávat výhradně uzel Master (Rank 0)
@@ -74,9 +119,8 @@ void runMaster(int argc, char** argv, int n, int m) {
 void runWorkerA(int rank, int n, int m) {
 	std::cout << "[Worker A (Rank " << rank << ")] Inicializovan a ceka na praci od Mastera..." << std::endl;
 
-	// 1. Zjistíme, jaké ranky mají naši podřízení (Worker B)
 	int first_worker_b = 1 + n + (rank - 1) * m;
-	std::queue<int> free_workers; // Fronta volných dělníků
+	std::queue<int> free_workers;
 	for (int i = 0; i < m; ++i) {
 		free_workers.push(first_worker_b + i);
 	}
@@ -84,7 +128,6 @@ void runWorkerA(int rank, int n, int m) {
 	bool running = true;
 	while (running) {
 		MPI_Status status;
-		// Čekáme na první zprávu od Mastera
 		MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 
 		if (status.MPI_TAG == TAG_URL_TO_WORKER_A) {
@@ -94,40 +137,31 @@ void runWorkerA(int rank, int n, int m) {
 			MPI_Recv(buffer.data(), msg_size, MPI_CHAR, 0, TAG_URL_TO_WORKER_A, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 			
 			std::string base_url(buffer.data());
-			std::cout << "---> [Worker A (Rank " << rank << ")] Startuji domenu: " << base_url << std::endl;
 
-			// Nástroje pro crawling
-			std::queue<std::string> url_queue;       // Fronta URL k prohledání
-			std::set<std::string> visited_urls;      // Množina už viděných URL (abychom se nezacyklili)
-			int active_workers = 0;                  // Počet aktuálně pracujících Workerů B
+			std::queue<std::string> url_queue;
+			std::set<std::string> visited_urls;
+			int active_workers = 0;
 
-			// Vložíme první URL od Mastera
 			url_queue.push(base_url);
 			visited_urls.insert(base_url);
 
-			// ==========================================
-			// HLAVNÍ CRAWLOVACÍ SMYČKA PRO DANOU DOMÉNU
-			// ==========================================
-			// Běží dokud máme co prohledávat, NEBO dokud ještě nějaký dělník pracuje
+			// Proměnné pro uložení výsledků celé domény
+			std::vector<std::string> map_nodes;
+			std::vector<std::pair<std::string, std::string>> map_edges;
+			std::string content_data = "";
+
 			while (!url_queue.empty() || active_workers > 0) {
-				
-				// 1. Rozdání práce volným dělníkům
 				while (!url_queue.empty() && !free_workers.empty()) {
 					std::string next_url = url_queue.front();
 					url_queue.pop();
-					
 					int worker_b = free_workers.front();
 					free_workers.pop();
-
-					// Pošleme úkol Workeru B
 					MPI_Send(next_url.c_str(), next_url.size() + 1, MPI_CHAR, worker_b, TAG_URL_TO_WORKER_B, MPI_COMM_WORLD);
 					active_workers++;
 				}
 
-				// 2. Čekání na výsledky od kohokoliv z pracujících dělníků
 				if (active_workers > 0) {
 					MPI_Status result_status;
-					// MPI_ANY_SOURCE znamená, že vezmeme zprávu od prvního dělníka, který ji pošle
 					MPI_Probe(MPI_ANY_SOURCE, TAG_RESULT_FROM_B, MPI_COMM_WORLD, &result_status);
 					
 					int res_size;
@@ -135,13 +169,10 @@ void runWorkerA(int rank, int n, int m) {
 					std::vector<char> res_buffer(res_size);
 					MPI_Recv(res_buffer.data(), res_size, MPI_CHAR, result_status.MPI_SOURCE, TAG_RESULT_FROM_B, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-					// Dělník, který nám to poslal, je opět volný!
 					free_workers.push(result_status.MPI_SOURCE);
 					active_workers--;
 
 					std::string result_msg(res_buffer.data());
-					
-					// 3. Rozsekání zprávy (URL|IMG|FORM|ODKAZY|NADPISY)
 					std::istringstream ss(result_msg);
 					std::string parsed_url, imgs, forms, links_str, headings_str;
 					std::getline(ss, parsed_url, '|');
@@ -150,45 +181,56 @@ void runWorkerA(int rank, int n, int m) {
 					std::getline(ss, links_str, '|');
 					std::getline(ss, headings_str, '|');
 
-					std::cout << "[Worker A (Rank " << rank << ")] Zpracoval jsem vysledek pro " << parsed_url << std::endl;
+					// ZÁPIS DO DAT PRO MASTERA
+					map_nodes.push_back(parsed_url);
+					content_data += "\"" + parsed_url + "\"\n";
+					content_data += "IMAGES " + imgs + "\n";
+					content_data += "FORMS " + forms + "\n";
 
-					// 4. Zpracování nalezených odkazů
+					int num_links = 0;
 					std::istringstream links_ss(links_str);
 					std::string link;
 					while (std::getline(links_ss, link, ',')) {
-						if (link.empty() || link[0] == '#') continue; // Ignorujeme prázdné odkazy a kotvy
+						if (link.empty() || link[0] == '#') continue;
+						num_links++;
 
 						std::string full_link = link;
-
-						// Jednoduché sestavení absolutní cesty (pro případ, že odkaz je např. "/galerie")
 						if (link.find("http") != 0) {
-							// Ořízneme base_url o poslední lomítko, pokud existuje a odkaz začíná lomítkem
 							std::string clean_base = base_url;
-							if (clean_base.back() == '/' && link[0] == '/') {
-								clean_base.pop_back();
-							} else if (clean_base.back() != '/' && link[0] != '/') {
-								clean_base += "/";
-							}
+							if (clean_base.back() == '/' && link[0] == '/') clean_base.pop_back();
+							else if (clean_base.back() != '/' && link[0] != '/') clean_base += "/";
 							full_link = clean_base + link;
 						}
 
-						// Zkontrolujeme, zda link patří do naší domény a zda jsme ho ještě neviděli
-						if (full_link.find(base_url) == 0 && visited_urls.find(full_link) == visited_urls.end()) {
-							visited_urls.insert(full_link); // Poznamenáme si, že jsme ho objevili
-							url_queue.push(full_link);      // Zařadíme do fronty na prohledání
-							std::cout << "  -> OBJEVEN NOVY ODKAZ: " << full_link << std::endl;
+						if (full_link.find(base_url) == 0) {
+							map_edges.push_back({parsed_url, full_link}); // Uložíme propojení stránek
+							if (visited_urls.find(full_link) == visited_urls.end()) {
+								visited_urls.insert(full_link);
+								url_queue.push(full_link);
+							}
 						}
 					}
+					// Doplníme počet odkazů a nadpisy
+					content_data += "LINKS " + std::to_string(num_links) + "\n";
+					std::istringstream head_ss(headings_str);
+					std::string head;
+					while (std::getline(head_ss, head, ',')) {
+						content_data += head + "\n";
+					}
+					content_data += "\n";
 				}
 			}
 
-			std::cout << "\n=============================================" << std::endl;
-			std::cout << ">>> DOMENA " << base_url << " BYLA KOMPLETNE PROCRAWLOVANA! <<<" << std::endl;
-			std::cout << "Celkem nalezene unikatni URL: " << visited_urls.size() << std::endl;
-			std::cout << "=============================================\n" << std::endl;
+			// VŠE HOTOVO: Zabalíme a pošleme Masterovi
+			std::string map_data = "";
+			for (const auto& node : map_nodes) map_data += "\"" + node + "\"\n";
+			for (const auto& edge : map_edges) map_data += "\"" + edge.first + "\" \"" + edge.second + "\"\n";
 
-			// Pro testování zatím zastavíme Worker A po jedné doméně
-			running = false; 
+			// Formát zprávy: BASE_URL ||| MAP_TXT ||| CONTENT_TXT
+			std::string final_payload = base_url + "|||" + map_data + "|||" + content_data;
+			
+			std::cout << "[Worker A (Rank " << rank << ")] Odesilam hotove vysledky Masterovi!" << std::endl;
+			MPI_Send(final_payload.c_str(), final_payload.size() + 1, MPI_CHAR, 0, TAG_DONE_FROM_A, MPI_COMM_WORLD);
 		}
 	}
 }
@@ -305,9 +347,6 @@ void runWorkerB(int rank, int n, int m) {
 
 			// Odeslání zprávy šéfovi (Worker A) s naším novým štítkem TAG_RESULT_FROM_B
 			MPI_Send(result_msg.c_str(), result_msg.size() + 1, MPI_CHAR, my_boss_rank, TAG_RESULT_FROM_B, MPI_COMM_WORLD);
-
-			// Zatím necháme ukončení, dokud neuděláme frontu ve Workeru A
-			running = false; 
 		}
 	}
 }
